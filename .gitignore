@@ -1,0 +1,5 @@
+# 前端依赖
+frontend/node_modules/
+
+# 后端模型/大文件
+backend/检测/Chinese_v3/

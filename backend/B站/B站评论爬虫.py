@@ -1,0 +1,258 @@
+import re
+import requests
+import json
+from urllib.parse import quote
+import pandas as pd
+import hashlib
+import urllib
+import time
+import csv
+
+# 获取B站的Header
+def get_Header():
+    import os
+    # 获取脚本所在目录的绝对路径
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # 构建cookie文件的绝对路径
+    cookie_path = os.path.join(script_dir, 'bili_cookie.txt')
+    with open(cookie_path,'r') as f:
+            cookie=f.read()
+    header={
+            "Cookie":cookie,
+            "User-Agent":'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0'
+    }
+    return header
+
+# 通过bv号，获取视频的oid
+def get_information(bv):
+    resp = requests.get(f"https://www.bilibili.com/video/{bv}",headers=get_Header())
+    # 提取视频oid
+    obj = re.compile(f'"aid":(?P<id>.*?),"bvid":"{bv}"')
+    oid = obj.search(resp.text).group('id')
+
+    # 提取视频的标题 - 尝试多种方式提取
+    title = "未识别"
+    try:
+        # 尝试1: data-vue-meta属性
+        obj = re.compile(r'<title data-vue-meta="true">(?P<title>.*?)</title>')
+        match = obj.search(resp.text)
+        if match:
+            title = match.group('title')
+        else:
+            # 尝试2: 普通title标签
+            obj = re.compile(r'<title>(?P<title>.*?)</title>')
+            match = obj.search(resp.text)
+            if match:
+                title = match.group('title')
+    except Exception as e:
+        print(f"提取标题失败: {e}")
+    
+    # 清理标题，移除特殊字符，增加长度限制
+    title = re.sub(r'[\\/:*?"<>|]', '', title)[:30] if title != "未识别" else title
+
+    return oid,title
+
+# MD5加密
+def md5(code):
+    MD5 = hashlib.md5()
+    MD5.update(code.encode('utf-8'))
+    w_rid = MD5.hexdigest()
+    return w_rid
+
+# 轮页爬取
+def start(bv, oid, pageID, count, csv_writer, is_second):
+    # 参数
+    mode = 3   # 为2时爬取的是最新评论，为3时爬取的是热门评论
+    plat = 1
+    type = 1  
+    web_location = 1315875
+
+    # 获取当下时间戳
+    wts = int(time.time())
+    
+    # 如果不是第一页
+    if pageID != '':
+        pagination_str = '{"offset":"%s"}' % pageID
+        code = f"mode={mode}&oid={oid}&pagination_str={urllib.parse.quote(pagination_str)}&plat={plat}&type={type}&web_location={web_location}&wts={wts}" + 'ea1db124af3c7062474693fa704f4ff8'
+        w_rid = md5(code)
+        url = f"https://api.bilibili.com/x/v2/reply/wbi/main?oid={oid}&type={type}&mode={mode}&pagination_str={urllib.parse.quote(pagination_str, safe=':')}&plat=1&web_location=1315875&w_rid={w_rid}&wts={wts}"
+    
+    # 如果是第一页
+    else:
+        pagination_str = '{"offset":""}'
+        code = f"mode={mode}&oid={oid}&pagination_str={urllib.parse.quote(pagination_str)}&plat={plat}&seek_rpid=&type={type}&web_location={web_location}&wts={wts}" + 'ea1db124af3c7062474693fa704f4ff8'
+        w_rid = md5(code)
+        url = f"https://api.bilibili.com/x/v2/reply/wbi/main?oid={oid}&type={type}&mode={mode}&pagination_str={urllib.parse.quote(pagination_str, safe=':')}&plat=1&seek_rpid=&web_location=1315875&w_rid={w_rid}&wts={wts}"
+    
+
+    comment = requests.get(url=url, headers=get_Header()).content.decode('utf-8')
+    comment = json.loads(comment)
+
+    for reply in comment['data']['replies']:
+        # 评论数量+1
+        count += 1
+
+        if count % 1000 ==0:
+            time.sleep(20)
+
+        # 上级评论ID
+        parent=reply["parent"]
+        # 评论ID
+        rpid = reply["rpid"]
+        # 用户ID
+        uid = reply["mid"]
+        # 用户名
+        name = reply["member"]["uname"]
+        # 用户等级
+        level = reply["member"]["level_info"]["current_level"]
+        # 性别
+        sex = reply["member"]["sex"]
+        # 头像
+        avatar = reply["member"]["avatar"]
+        # 是否是大会员
+        if reply["member"]["vip"]["vipStatus"] == 0:
+            vip = "否"
+        else:
+            vip = "是"
+        # IP属地
+        try:
+            IP = reply["reply_control"]['location'][5:]
+        except:
+            IP = "未知"
+        # 内容
+        context = reply["content"]["message"]
+        # 评论时间
+        reply_time = pd.to_datetime(reply["ctime"], unit='s')
+        # 相关回复数
+        try:
+            rereply = reply["reply_control"]["sub_reply_entry_text"]
+            rereply = int(re.findall(r'\d+', rereply)[0])
+        except:
+            rereply = 0
+        # 点赞数
+        like = reply['like']
+
+        # 个性签名
+        try:
+            sign = reply['member']['sign']
+        except:
+            sign = ''
+
+        # 写入CSV文件
+        csv_writer.writerow([count, parent, rpid, uid, name, level, sex, context, reply_time, rereply, like, sign, IP, vip, avatar])
+
+        # 二级评论(如果开启了二级评论爬取，且该评论回复数不为0，则爬取该评论的二级评论)
+        if is_second and rereply !=0:
+            for page in range(1,rereply//10+2):
+                second_url=f"https://api.bilibili.com/x/v2/reply/reply?oid={oid}&type=1&root={rpid}&ps=10&pn={page}&web_location=333.788"
+                second_comment=requests.get(url=second_url,headers=get_Header()).content.decode('utf-8')
+                second_comment=json.loads(second_comment)
+                # 检查二级评论数据是否存在
+                if second_comment['data'] and second_comment['data']['replies']:
+                    for second in second_comment['data']['replies']:
+                        # 评论数量+1
+                        count += 1
+                        # 上级评论ID
+                        parent=second["parent"]
+                        # 评论ID
+                        second_rpid = second["rpid"]
+                        # 用户ID
+                        uid = second["mid"]
+                        # 用户名
+                        name = second["member"]["uname"]
+                        # 用户等级
+                        level = second["member"]["level_info"]["current_level"]
+                        # 性别
+                        sex = second["member"]["sex"]
+                        # 头像
+                        avatar = second["member"]["avatar"]
+                        # 是否是大会员
+                        if second["member"]["vip"]["vipStatus"] == 0:
+                            vip = "否"
+                        else:
+                            vip = "是"
+                        # IP属地
+                        try:
+                            IP = second["reply_control"]['location'][5:]
+                        except:
+                            IP = "未知"
+                        # 内容
+                        context = second["content"]["message"]
+                        # 评论时间
+                        reply_time = pd.to_datetime(second["ctime"], unit='s')
+                        # 相关回复数
+                        try:
+                            rereply = second["reply_control"]["sub_reply_entry_text"]
+                            rereply = re.findall(r'\d+', rereply)[0]
+                        except:
+                            rereply = 0
+                        # 点赞数
+                        like = second['like']
+                        # 个性签名
+                        try:
+                            sign = second['member']['sign']
+                        except:
+                            sign = ''
+
+                        # 写入CSV文件
+                        csv_writer.writerow([count, parent, second_rpid, uid, name, level, sex, context, reply_time, rereply, like, sign, IP, vip, avatar])
+            
+
+
+    # 下一页的pageID
+    try:
+        next_pageID = comment['data']['cursor']['pagination_reply']['next_offset']
+    except:
+        next_pageID = 0
+
+    # 判断是否是最后一页了
+    if next_pageID == 0:
+        print(f"评论爬取完成！总共爬取{count}条。")
+        return bv, oid, next_pageID, count, csv_writer,is_second
+    # 如果不是最后一页，则停0.5s（避免反爬机制）
+    else:
+        time.sleep(0.5)
+        print(f"当前爬取{count}条。")
+        return bv, oid, next_pageID, count, csv_writer,is_second
+
+if __name__ == "__main__":
+    import os
+    import sys
+
+    # 从命令行获取参数
+    if len(sys.argv) < 2:
+        print("Usage: python B站评论爬虫.py <bv> [is_second]")
+        sys.exit(1)
+    
+    bv = sys.argv[1]
+    # 第二个参数可选，默认为False
+    is_second = sys.argv[2].lower() == 'true' if len(sys.argv) > 2 else False
+    
+    # 获取视频oid和标题
+    oid,title = get_information(bv)
+    # 评论起始页（默认为空）
+    next_pageID = ''
+    # 初始化评论数量
+    count = 0
+
+    # 创建CSV文件并写入表头
+    # 获取当前脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # 构建result文件夹路径
+    result_dir = os.path.join(script_dir, '../result')
+    # 确保result文件夹存在
+    os.makedirs(result_dir, exist_ok=True)
+    # 构建CSV文件路径 - 统一命名规范：平台+对应id
+    csv_filename = f'B站评论_{bv}.csv'
+    csv_path = os.path.join(result_dir, csv_filename)
+    print(f"将评论保存到: {csv_path}")
+    with open(csv_path, mode='w', newline='', encoding='utf-8-sig') as file:
+        csv_writer = csv.writer(file)
+        # 统一列命名规范：用户名列改为"用户名"，评论内容列改为"评论内容"
+        csv_writer.writerow(['序号', '上级评论ID','评论ID', '用户ID', '用户名', '用户等级', '性别', '评论内容', '评论时间', '回复数', '点赞数', '个性签名', 'IP属地', '是否是大会员', '头像'])
+
+        # 开始爬取
+        print("爬取中，请耐心等待...")
+        while next_pageID != 0:
+            bv, oid, next_pageID, count, csv_writer,is_second=start(bv, oid, next_pageID, count, csv_writer,is_second)
+
